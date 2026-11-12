@@ -99,10 +99,13 @@
         <label class="sc"><input type="checkbox" id="scDup"> 重复消息（同一条增量发两遍）</label>
         <label class="sc"><input type="checkbox" id="scGap"> 缺号注入（周期性跳过更新编号）</label>
         <label class="sc"><input type="checkbox" id="scDisc"> 断线注入（周期性关闭连接）</label>
+        <label class="sc"><input type="checkbox" id="scStall"> 关闭握手不响应（行情源对 close 帧不作答）</label>
       </div>
     </div>
     <div class="hint">
-      验证要点：快照延迟期间增量被缓存、不就绪；重复消息按 u ≤ L 丢弃；缺号（U &gt; L+1）与断线立即停止发布并自动重同步；快照失败时状态绝不变为「已同步」。
+      验证要点：快照延迟期间增量被缓存、不就绪；重复消息按 u ≤ L 丢弃；快照失败时状态绝不变为「已同步」。<br>
+      缺号（U &gt; L+1）/断线：立即撤下报价与编号、显示故障原因，再清理连接（关闭握手最多 1 秒，超时强制断开），随后自动重同步。<br>
+      组合演示：勾选「缺号注入」+「关闭握手不响应」——清理期间报价立即失效（旧盘口不得标为可用），约 1 秒强制断开后恢复同步。
     </div>
   </div>
 </div>
@@ -126,9 +129,10 @@ function currentScenario() {
     duplicates: $("scDup").checked,
     gap: $("scGap").checked,
     disconnect: $("scDisc").checked,
+    close_stall: $("scStall").checked,
   };
 }
-for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc"]) {
+for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc", "scStall"]) {
   $(id).onchange = () => post("/api/scenario", currentScenario());
 }
 
@@ -170,6 +174,7 @@ async function loadScenario() {
     $("scDup").checked = sc.duplicates;
     $("scGap").checked = sc.gap;
     $("scDisc").checked = sc.disconnect;
+    $("scStall").checked = !!sc.close_stall;
   } catch (e) { /* 忽略 */ }
 }
 

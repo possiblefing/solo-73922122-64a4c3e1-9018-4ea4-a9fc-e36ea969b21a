@@ -10,14 +10,26 @@
   duplicates         每条增量消息重复发送一次
   gap                周期性跳过更新编号（制造缺号）
   disconnect         周期性关闭全部 WebSocket 连接
+  close_stall        关闭握手不响应：客户端发出 close 帧后连接陷入静默
+
+运行方式：
+  python app.py            # 对外端口 8001（TCP 中继）→ 本机 uvicorn 8011
+
+说明：uvicorn 的 WebSocket 协议层会自动回复 close 帧，无法在应用内模拟
+「关闭握手不响应」。因此本进程在对外端口上运行一个极简 TCP 中继，原样转发
+HTTP/WS 流量；仅当 close_stall 开启且客户端发出 WS close 帧时，中继进入
+静默（双向停止转发但保持连接），使采集端的关闭握手迟迟得不到回应。
+直接以 `uvicorn app:app --port 8011` 调试可绕过中继（无 close_stall 效果）。
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import time
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -28,6 +40,12 @@ MAX_BAND = 150          # 模拟盘口维持在中间价 ±150 个 tick
 SNAPSHOT_LIMIT = 100
 TICK_INTERVAL = 0.2     # 增量推送间隔（秒）
 
+APP_HOST = "127.0.0.1"
+APP_PORT = int(os.getenv("APP_PORT", "8011"))        # uvicorn 实际监听（仅本机内部）
+PUBLIC_PORT = int(os.getenv("PUBLIC_PORT", "8001"))  # 对外端口（TCP 中继）
+
+WS_CLOSE_OPCODE = 0x8
+
 
 class Scenario(BaseModel):
     snapshot_delay_ms: int = 0
@@ -35,6 +53,7 @@ class Scenario(BaseModel):
     duplicates: bool = False
     gap: bool = False
     disconnect: bool = False
+    close_stall: bool = False  # 关闭握手不响应
 
 
 scenario = Scenario()
@@ -203,3 +222,147 @@ async def root():
         "websocket": f"/ws/{SYMBOL.lower()}@depth",
         "scenario": scenario.model_dump(),
     }
+
+
+# ------------------------- 关闭握手不响应场景（TCP 中继） -------------------------
+
+
+class CloseFrameScanner:
+    """增量解析客户端→服务端的 WS 帧，发现 close 帧（opcode 0x8）即报告。
+
+    只需定位帧边界：帧头 2 字节 + 扩展长度 + 掩码键，随后是载荷。
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.found = False
+
+    def feed(self, data: bytes) -> bool:
+        if self.found:
+            return True
+        self.buf += data
+        while True:
+            if len(self.buf) < 2:
+                return False
+            b1 = self.buf[1]
+            length = b1 & 0x7F
+            header = 2 + (4 if b1 & 0x80 else 0)  # 掩码键 4 字节
+            if length == 126:
+                header += 2
+            elif length == 127:
+                header += 8
+            if len(self.buf) < header:
+                return False
+            if length == 126:
+                length = int.from_bytes(self.buf[2:4], "big")
+            elif length == 127:
+                length = int.from_bytes(self.buf[2:10], "big")
+            total = header + length
+            if len(self.buf) < total:
+                return False
+            if self.buf[0] & 0x0F == WS_CLOSE_OPCODE:
+                self.found = True
+                return True
+            del self.buf[:total]
+
+
+async def relay_connection(client_reader: asyncio.StreamReader,
+                           client_writer: asyncio.StreamWriter) -> None:
+    """转发 客户端↔uvicorn 流量；close_stall 开启时，客户端 close 帧之后进入静默。
+
+    静默期间双向字节一律丢弃、两侧 TCP 连接均保持打开：上游应答 close 帧后
+    会主动关闭 TCP，但该 EOF 不得传播给客户端，否则客户端会把它当作握手完成。
+    """
+    try:
+        upstream_reader, upstream_writer = await asyncio.open_connection(APP_HOST, APP_PORT)
+    except OSError:
+        client_writer.close()
+        return
+
+    stalled = False  # 静默中：双向字节一律丢弃，但继续读取以排空缓冲
+
+    async def client_to_upstream() -> None:
+        nonlocal stalled
+        request = bytearray()
+        is_ws: bool | None = None  # None=请求头未收齐
+        scanner = CloseFrameScanner()
+        try:
+            while True:
+                data = await client_reader.read(65536)
+                if not data:
+                    return
+                if stalled:
+                    continue  # 静默：丢弃客户端后续字节
+                if is_ws is None:
+                    request += data
+                    if b"\r\n\r\n" not in request:
+                        continue  # 等请求头收齐，以判定是否为 WS 升级
+                    headers, _, rest = bytes(request).partition(b"\r\n\r\n")
+                    is_ws = b"upgrade: websocket" in headers.lower()
+                    upstream_writer.write(headers + b"\r\n\r\n" + rest)
+                    await upstream_writer.drain()
+                    if not is_ws:
+                        continue  # 普通 HTTP：此后原样透传
+                    if rest and scanner.feed(rest) and scenario.close_stall:
+                        stalled = True
+                    continue
+                if is_ws and scanner.feed(data) and scenario.close_stall:
+                    # 触发静默：本帧（含 close 帧）仍送达，此后双向不再转发
+                    stalled = True
+                upstream_writer.write(data)
+                await upstream_writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            return
+
+    async def upstream_to_client() -> None:
+        try:
+            while True:
+                data = await upstream_reader.read(65536)
+                if not data:
+                    return
+                if stalled:
+                    continue  # 静默：丢弃服务端字节（含 close 帧回应）
+                client_writer.write(data)
+                await client_writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            return
+
+    c2u = asyncio.create_task(client_to_upstream())
+    u2c = asyncio.create_task(upstream_to_client())
+    done, _ = await asyncio.wait({c2u, u2c}, return_when=asyncio.FIRST_COMPLETED)
+    if c2u in done:
+        u2c.cancel()  # 客户端断开：结束转发
+    elif stalled:
+        # 静默中上游先关闭（应答 close 后主动断 TCP）：保持客户端连接，
+        # 等客户端放弃（采集端关闭握手超时后强制断开），不得传播该 EOF
+        await c2u
+        u2c.cancel()
+    else:
+        c2u.cancel()  # 常规上游断开：结束转发
+    await asyncio.gather(c2u, u2c, return_exceptions=True)
+    for writer in (client_writer, upstream_writer):
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def main() -> None:
+    relay = await asyncio.start_server(relay_connection, "0.0.0.0", PUBLIC_PORT)
+    config = uvicorn.Config(app, host=APP_HOST, port=APP_PORT, log_level="info")
+    server = uvicorn.Server(config)
+    async with relay:
+        server_task = asyncio.create_task(server.serve())
+        relay_task = asyncio.create_task(relay.serve_forever())
+        # uvicorn 收到退出信号（或启动失败）即结束，随后关停中继，进程整体退出
+        await asyncio.wait({server_task, relay_task}, return_when=asyncio.FIRST_COMPLETED)
+        relay_task.cancel()
+        if not server_task.done():
+            server.should_exit = True
+        await asyncio.gather(server_task, relay_task, return_exceptions=True)
+        if server_task.done() and not server_task.cancelled():
+            server_task.result()  # 启动失败等异常向上抛出
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
